@@ -394,6 +394,16 @@ pub enum ThemeMode {
     Light,
 }
 
+/// Selects how FFprobe inspects media duration and stream headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DurationScanMode {
+    /// Standard header-level FFprobe metadata inspection.
+    #[default]
+    FastScan,
+    /// Extended FFprobe analyze duration and probe size for complex containers.
+    DeepProbe,
+}
+
 /// Stores all persisted and runtime EzThumb configuration values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -408,6 +418,7 @@ pub struct EzConfig {
     pub include_first_frame: bool,
     pub include_last_frame: bool,
     pub accurate_seek: bool,
+    pub duration_scan: DurationScanMode,
     pub show_info: bool,
     pub info_position: TextPosition,
     pub show_timestamp: bool,
@@ -445,6 +456,7 @@ impl Default for EzConfig {
             include_first_frame: false,
             include_last_frame: false,
             accurate_seek: false,
+            duration_scan: DurationScanMode::FastScan,
             show_info: true,
             info_position: TextPosition::LeftTop,
             show_timestamp: true,

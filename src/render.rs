@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::config::{ConflictPolicy, EzConfig, OutputFormat, TextPosition};
 use crate::ffmpeg::{extract_frames, CapturedFrame, FfmpegError};
-use crate::probe::{format_timestamp_hms, probe_video, MediaInfo, ProbeError};
+use crate::probe::{format_timestamp_hms, probe_video_with_mode, MediaInfo, ProbeError};
 
 /// Represents errors produced while composing or writing output images.
 #[derive(Debug, Error)]
@@ -105,7 +105,7 @@ where
         });
     }
 
-    let info = probe_video(path, config.video_stream_index)?;
+    let info = probe_video_with_mode(path, config.video_stream_index, config.duration_scan)?;
     let frames = extract_frames(&info, config, cancel, on_progress)?;
     if frames.is_empty() {
         return Err(RenderError::NoFrames);

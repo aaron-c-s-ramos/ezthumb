@@ -4,7 +4,13 @@ use std::process::Command;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::config::SizeUnit;
+use crate::config::{DurationScanMode, SizeUnit};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Represents errors produced while locating or invoking FFprobe.
 #[derive(Debug, Error)]
@@ -136,23 +142,37 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Probes a video file using external ffprobe and returns structured metadata.
+/// Builds ffprobe CLI arguments according to the chosen duration scan mode.
+pub fn build_ffprobe_args(scan_mode: DurationScanMode) -> Vec<&'static str> {
+    let mut args = vec!["-v", "error"];
+    if scan_mode == DurationScanMode::DeepProbe {
+        args.extend(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+    }
+    args.extend(["-print_format", "json", "-show_format", "-show_streams"]);
+    args
+}
+
+/// Probes a video file using external ffprobe with the default fast header scan.
 pub fn probe_video(
     path: &Path,
     video_stream_index: Option<usize>,
 ) -> Result<MediaInfo, ProbeError> {
+    probe_video_with_mode(path, video_stream_index, DurationScanMode::FastScan)
+}
+
+/// Probes a video file using external ffprobe and returns structured metadata.
+pub fn probe_video_with_mode(
+    path: &Path,
+    video_stream_index: Option<usize>,
+    scan_mode: DurationScanMode,
+) -> Result<MediaInfo, ProbeError> {
     let ffprobe = find_binary("ffprobe").ok_or(ProbeError::FfprobeNotFound)?;
-    let output = Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output()?;
+    let mut cmd = Command::new(ffprobe);
+    cmd.args(build_ffprobe_args(scan_mode)).arg(path);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -392,5 +412,16 @@ mod tests {
     fn formats_timestamps_cleanly() {
         assert_eq!(format_timestamp_hms(0), "00:00:00");
         assert_eq!(format_timestamp_hms(3_661_000), "01:01:01");
+    }
+
+    #[test]
+    fn builds_ffprobe_args_for_fast_and_deep_modes() {
+        let fast = build_ffprobe_args(DurationScanMode::FastScan);
+        assert!(!fast.contains(&"-analyzeduration"));
+        assert!(fast.contains(&"-show_format"));
+
+        let deep = build_ffprobe_args(DurationScanMode::DeepProbe);
+        assert!(deep.contains(&"-analyzeduration"));
+        assert!(deep.contains(&"-probesize"));
     }
 }

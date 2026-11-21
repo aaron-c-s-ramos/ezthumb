@@ -12,18 +12,18 @@ use eframe::egui::{
 
 use crate::cli::collect_video_files;
 use crate::config::{
-    ConflictPolicy, DurationScanMode, EzConfig, OutputFormat, RgbColor, SizeSpec, TextPosition,
-    ThemeMode,
+    ConflictPolicy, DurationScanMode, EzConfig, FontSource, GridSetting, OutputFormat,
+    ProcessMethod, RgbColor, SizeSpec, TextPosition, ThemeMode,
 };
 use crate::probe::{find_binary, probe_video_with_mode};
-use crate::render::process_video;
+use crate::render::{discover_system_fonts, process_video, SystemFontEntry};
 
 /// Global typography multiplier applied across all egui text styles.
 pub const FONT_SCALE: f32 = 1.5_f32;
 
 const BASE_HEADER_FONT_SIZE: f32 = 17.0_f32;
-const LABEL_COL_WIDTH: f32 = 250.0_f32;
-const COMBO_WIDTH: f32 = 285.0_f32;
+const LABEL_COL_WIDTH: f32 = 245.0_f32;
+const COMBO_WIDTH: f32 = 365.0_f32;
 
 /// Scales every default egui text style by FONT_SCALE.
 pub fn scaled_text_styles() -> BTreeMap<TextStyle, FontId> {
@@ -48,24 +48,47 @@ pub fn format_duration_compact(ms: u64) -> String {
 
 /// Builds the compact Queue footer summary from active grid, zoom, and scan settings.
 pub fn format_queue_footer(config: &EzConfig) -> String {
-    let grid_part = if config.grid.is_individual() {
-        format!("Separate: {} frames", config.grid.rows)
-    } else if let Some(step_ms) = config.timestep_ms.filter(|s| *s > 0) {
-        let step_s = (step_ms / 1000).max(1);
-        format!("Grid: {} cols ({}s step)", config.grid.cols, step_s)
-    } else {
-        format!("Grid: {}x{}", config.grid.cols, config.grid.rows)
+    let grid_part = match config.grid_setting {
+        GridSetting::Auto => "Grid: Auto".to_string(),
+        GridSetting::ColumnAndRow => {
+            if config.grid.is_individual() {
+                format!("Discrete: {} frames", config.grid.rows)
+            } else {
+                format!("Grid: {}x{}", config.grid.cols, config.grid.rows)
+            }
+        }
+        GridSetting::ColumnAndStep => {
+            let step_s = config
+                .timestep_ms
+                .filter(|s| *s > 0)
+                .map(|ms| (ms / 1000).max(1))
+                .unwrap_or(60);
+            format!("Grid: {} cols (Every {}s)", config.grid.cols.max(1), step_s)
+        }
+        GridSetting::DiscreteByNumber => format!("Discrete: {} frames", config.grid.rows.max(1)),
+        GridSetting::DiscreteByStep => {
+            let step_s = config
+                .timestep_ms
+                .filter(|s| *s > 0)
+                .map(|ms| (ms / 1000).max(1))
+                .unwrap_or(60);
+            format!("Discrete: Every {step_s}s")
+        }
+        GridSetting::DiscreteKeyFrames => "Discrete: Key Frames".to_string(),
     };
 
     let zoom_part = match config.size {
+        SizeSpec::Auto => "Zoom: Auto".to_string(),
         SizeSpec::ZoomPercent(pct) => format!("Zoom to {pct}%"),
-        SizeSpec::CanvasWidth(w) => format!("Width {w}px"),
-        SizeSpec::TilePixels { width, height } => format!("Tile {width}x{height}"),
+        SizeSpec::CanvasWidth(w) => format!("Canvas {w}px"),
+        SizeSpec::TilePixels { width, height } => format!("Size {width}x{height}"),
     };
 
     let scan_part = match config.duration_scan {
+        DurationScanMode::Auto => "Duration: Auto",
         DurationScanMode::FastScan => "Fast Scan",
-        DurationScanMode::DeepProbe => "Deep Probe",
+        DurationScanMode::FullScan => "Full Scan",
+        DurationScanMode::FileHead => "File Head",
     };
 
     format!("{grid_part}  |  {zoom_part}  |  {scan_part}")
@@ -75,8 +98,8 @@ pub fn format_queue_footer(config: &EzConfig) -> String {
 pub fn run_gui(initial_files: Vec<PathBuf>, config: EzConfig) -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
         .with_title("EzThumb")
-        .with_inner_size([980.0, 680.0])
-        .with_min_inner_size([860.0, 580.0]);
+        .with_inner_size([1040.0, 690.0])
+        .with_min_inner_size([920.0, 580.0]);
 
     let options = eframe::NativeOptions {
         viewport,
@@ -102,17 +125,11 @@ enum ActiveTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GridMode {
-    ColumnAndRow,
-    TimeStep,
-    SeparateFrames,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZoomMode {
+    Auto,
     ZoomByRatio,
-    CanvasWidth,
-    FixedTileSize,
+    ZoomByCanvas,
+    ZoomBySize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,14 +219,12 @@ enum WorkerEvent {
 
 struct SettingsDraft {
     config: EzConfig,
-    grid_mode: GridMode,
     timestep_secs: u64,
     zoom_mode: ZoomMode,
     zoom_percent: u32,
     canvas_width: u32,
     tile_width: u32,
     tile_height: u32,
-    use_custom_font: bool,
     use_custom_outdir: bool,
     outdir_input: String,
     bg_hex_input: String,
@@ -219,13 +234,6 @@ struct SettingsDraft {
 
 impl SettingsDraft {
     fn from_config(config: &EzConfig) -> Self {
-        let grid_mode = if config.grid.is_individual() {
-            GridMode::SeparateFrames
-        } else if config.timestep_ms.filter(|s| *s > 0).is_some() {
-            GridMode::TimeStep
-        } else {
-            GridMode::ColumnAndRow
-        };
         let timestep_secs = config
             .timestep_ms
             .filter(|s| *s > 0)
@@ -233,14 +241,14 @@ impl SettingsDraft {
             .unwrap_or(60);
 
         let (zoom_mode, zoom_percent, canvas_width, tile_width, tile_height) = match config.size {
+            SizeSpec::Auto => (ZoomMode::Auto, 50, 1280, 320, 180),
             SizeSpec::ZoomPercent(pct) => (ZoomMode::ZoomByRatio, pct, 1280, 320, 180),
-            SizeSpec::CanvasWidth(w) => (ZoomMode::CanvasWidth, 50, w, 320, 180),
+            SizeSpec::CanvasWidth(w) => (ZoomMode::ZoomByCanvas, 50, w, 320, 180),
             SizeSpec::TilePixels { width, height } => {
-                (ZoomMode::FixedTileSize, 50, 1280, width, height)
+                (ZoomMode::ZoomBySize, 50, 1280, width, height)
             }
         };
 
-        let use_custom_font = config.font_path.is_some();
         let use_custom_outdir = config.outdir.is_some();
         let outdir_input = config
             .outdir
@@ -253,14 +261,12 @@ impl SettingsDraft {
             info_hex_input: config.info_color.to_hex(),
             time_hex_input: config.timestamp_color.to_hex(),
             config: config.clone(),
-            grid_mode,
             timestep_secs,
             zoom_mode,
             zoom_percent,
             canvas_width,
             tile_width,
             tile_height,
-            use_custom_font,
             use_custom_outdir,
             outdir_input,
         }
@@ -270,34 +276,48 @@ impl SettingsDraft {
     fn to_config(&self) -> Result<EzConfig, String> {
         let mut out = self.config.clone();
 
-        match self.grid_mode {
-            GridMode::ColumnAndRow => {
+        match out.grid_setting {
+            GridSetting::Auto => {
+                out.timestep_ms = None;
+            }
+            GridSetting::ColumnAndRow => {
                 out.grid.cols = out.grid.cols.clamp(1, 32);
                 out.grid.rows = out.grid.rows.clamp(1, 200);
                 out.timestep_ms = None;
             }
-            GridMode::TimeStep => {
+            GridSetting::ColumnAndStep => {
                 out.grid.cols = out.grid.cols.clamp(1, 32);
                 out.grid.rows = out.grid.rows.clamp(1, 200);
                 out.timestep_ms = Some(self.timestep_secs.clamp(1, 3600) * 1000);
             }
-            GridMode::SeparateFrames => {
+            GridSetting::DiscreteByNumber => {
                 out.grid.cols = 0;
                 out.grid.rows = out.grid.rows.clamp(1, 200);
+                out.timestep_ms = None;
+            }
+            GridSetting::DiscreteByStep => {
+                out.grid.cols = 0;
+                out.timestep_ms = Some(self.timestep_secs.clamp(1, 3600) * 1000);
+            }
+            GridSetting::DiscreteKeyFrames => {
+                out.grid.cols = 0;
                 out.timestep_ms = None;
             }
         }
 
         out.size = match self.zoom_mode {
+            ZoomMode::Auto => SizeSpec::Auto,
             ZoomMode::ZoomByRatio => SizeSpec::ZoomPercent(self.zoom_percent.clamp(10, 400)),
-            ZoomMode::CanvasWidth => SizeSpec::CanvasWidth(self.canvas_width.clamp(320, 8192)),
-            ZoomMode::FixedTileSize => SizeSpec::TilePixels {
+            ZoomMode::ZoomByCanvas => SizeSpec::CanvasWidth(self.canvas_width.clamp(320, 8192)),
+            ZoomMode::ZoomBySize => SizeSpec::TilePixels {
                 width: self.tile_width.clamp(32, 4096),
                 height: self.tile_height.clamp(24, 4096),
             },
         };
 
-        if !self.use_custom_font {
+        out.accurate_seek = out.process_method == ProcessMethod::FrameByFrame;
+
+        if out.font_source == FontSource::SystemDefault {
             out.font_path = None;
         }
 
@@ -338,6 +358,7 @@ struct EzThumbApp {
     active_tab: ActiveTab,
     entries: Vec<QueueEntry>,
     selected_index: Option<usize>,
+    system_fonts: Vec<SystemFontEntry>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     status_message: Option<String>,
@@ -355,6 +376,7 @@ impl EzThumbApp {
     fn new(initial_files: Vec<PathBuf>, config: EzConfig) -> Self {
         let ffmpeg_path = find_binary("ffmpeg");
         let ffprobe_path = find_binary("ffprobe");
+        let system_fonts = discover_system_fonts();
         let (probe_tx, probe_rx) = mpsc::channel();
         let draft = SettingsDraft::from_config(&config);
 
@@ -375,6 +397,7 @@ impl EzThumbApp {
             active_tab: ActiveTab::Queue,
             entries: Vec::new(),
             selected_index: None,
+            system_fonts,
             ffmpeg_path,
             ffprobe_path,
             status_message,
@@ -692,6 +715,30 @@ impl EzThumbApp {
         }
     }
 
+    fn selected_font_display(&self) -> String {
+        match (self.draft.config.font_source, &self.draft.config.font_path) {
+            (FontSource::SystemDefault, _) => "Segoe UI (Default)".to_string(),
+            (FontSource::SystemFont, Some(path)) => self
+                .system_fonts
+                .iter()
+                .find(|f| &f.path == path)
+                .map(|f| f.display_name.clone())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("System Font")
+                        .to_string()
+                }),
+            (FontSource::SystemFont, None) => "Select an installed font".to_string(),
+            (FontSource::CustomFile, Some(path)) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Custom Font")
+                .to_string(),
+            (FontSource::CustomFile, None) => "No custom font selected".to_string(),
+        }
+    }
+
     fn render_queue_table(&mut self, ui: &mut Ui) {
         let dark = self.config.theme == ThemeMode::Dark;
         let running = self.is_running();
@@ -749,7 +796,6 @@ impl EzThumbApp {
         let header_h = 34.0_f32;
         let row_h = 32.0_f32;
 
-        // Paint outer table surface and column header strip.
         let painter = ui.painter();
         painter.rect_filled(table_rect, CornerRadius::same(2), table_bg);
         let header_rect =
@@ -773,7 +819,6 @@ impl EzThumbApp {
             );
         }
 
-        // Scrollable rows area below header.
         let body_rect = Rect::from_min_max(
             egui::pos2(table_rect.left(), table_rect.top() + header_h),
             table_rect.max,
@@ -894,7 +939,6 @@ impl EzThumbApp {
                                 );
                             }
 
-                            // Hover tooltip showing full path, probe issue, or output path.
                             let tooltip =
                                 match (&entry.progress, &entry.output_path, &entry.probe_state) {
                                     (RowProgress::Error(err), _, _) => {
@@ -939,7 +983,6 @@ impl EzThumbApp {
                 });
         });
 
-        // Paint crisp vertical column dividers and outer frame border over the full table.
         let stroke = Stroke::new(1.0_f32, border_color);
         let painter = ui.painter();
         painter.line_segment(
@@ -965,7 +1008,6 @@ impl EzThumbApp {
             egui::StrokeKind::Inside,
         );
 
-        // Advance cursor past the manually positioned table rect.
         ui.allocate_rect(table_rect, Sense::hover());
 
         if let Some(idx) = context_remove_idx {
@@ -1083,46 +1125,40 @@ impl EzThumbApp {
                 // Section 1: Profile Selection
                 section_header(ui, "Profile Selection");
                 indented_form_row(ui, "Grid Setting", |ui| {
-                    egui::ComboBox::from_id_salt("grid_mode_combo")
+                    egui::ComboBox::from_id_salt("grid_setting_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(match self.draft.grid_mode {
-                            GridMode::ColumnAndRow => "Column and Row",
-                            GridMode::TimeStep => "Time Step",
-                            GridMode::SeparateFrames => "Separate Frames",
-                        })
+                        .selected_text(grid_setting_label(self.draft.config.grid_setting))
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_value(
-                                    &mut self.draft.grid_mode,
-                                    GridMode::ColumnAndRow,
-                                    "Column and Row",
-                                )
-                                .changed()
-                                && self.draft.config.grid.cols == 0
-                            {
-                                self.draft.config.grid.cols = 4;
+                            for mode in [
+                                GridSetting::Auto,
+                                GridSetting::ColumnAndRow,
+                                GridSetting::ColumnAndStep,
+                                GridSetting::DiscreteByNumber,
+                                GridSetting::DiscreteByStep,
+                                GridSetting::DiscreteKeyFrames,
+                            ] {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.draft.config.grid_setting,
+                                        mode,
+                                        grid_setting_label(mode),
+                                    )
+                                    .changed()
+                                    && matches!(
+                                        mode,
+                                        GridSetting::ColumnAndRow | GridSetting::ColumnAndStep
+                                    )
+                                    && self.draft.config.grid.cols == 0
+                                {
+                                    self.draft.config.grid.cols = 4;
+                                }
                             }
-                            if ui
-                                .selectable_value(
-                                    &mut self.draft.grid_mode,
-                                    GridMode::TimeStep,
-                                    "Time Step",
-                                )
-                                .changed()
-                                && self.draft.config.grid.cols == 0
-                            {
-                                self.draft.config.grid.cols = 4;
-                            }
-                            ui.selectable_value(
-                                &mut self.draft.grid_mode,
-                                GridMode::SeparateFrames,
-                                "Separate Frames",
-                            );
                         });
 
                     ui.add_space(10.0);
-                    match self.draft.grid_mode {
-                        GridMode::ColumnAndRow => {
+                    match self.draft.config.grid_setting {
+                        GridSetting::Auto => {}
+                        GridSetting::ColumnAndRow => {
                             ui.label("Grid");
                             ui.add(
                                 egui::DragValue::new(&mut self.draft.config.grid.cols)
@@ -1134,23 +1170,36 @@ impl EzThumbApp {
                                     .range(1..=200),
                             );
                         }
-                        GridMode::TimeStep => {
+                        GridSetting::ColumnAndStep => {
                             ui.label("Cols");
                             ui.add(
                                 egui::DragValue::new(&mut self.draft.config.grid.cols)
                                     .range(1..=32),
                             );
-                            ui.label("Step (s)");
+                            ui.label("Every");
                             ui.add(
-                                egui::DragValue::new(&mut self.draft.timestep_secs).range(1..=3600),
+                                egui::DragValue::new(&mut self.draft.timestep_secs)
+                                    .range(1..=3600)
+                                    .suffix(" s"),
                             );
                         }
-                        GridMode::SeparateFrames => {
+                        GridSetting::DiscreteByNumber => {
                             ui.label("Count");
                             ui.add(
                                 egui::DragValue::new(&mut self.draft.config.grid.rows)
                                     .range(1..=200),
                             );
+                        }
+                        GridSetting::DiscreteByStep => {
+                            ui.label("Every");
+                            ui.add(
+                                egui::DragValue::new(&mut self.draft.timestep_secs)
+                                    .range(1..=3600)
+                                    .suffix(" s"),
+                            );
+                        }
+                        GridSetting::DiscreteKeyFrames => {
+                            ui.label(RichText::new("I-frames").weak());
                         }
                     }
                 });
@@ -1158,31 +1207,25 @@ impl EzThumbApp {
                 indented_form_row(ui, "Zoom Setting", |ui| {
                     egui::ComboBox::from_id_salt("zoom_mode_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(match self.draft.zoom_mode {
-                            ZoomMode::ZoomByRatio => "Zoom by Ratio",
-                            ZoomMode::CanvasWidth => "Canvas Width",
-                            ZoomMode::FixedTileSize => "Fixed Tile Size",
-                        })
+                        .selected_text(zoom_mode_label(self.draft.zoom_mode))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.draft.zoom_mode,
+                            for mode in [
+                                ZoomMode::Auto,
                                 ZoomMode::ZoomByRatio,
-                                "Zoom by Ratio",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.zoom_mode,
-                                ZoomMode::CanvasWidth,
-                                "Canvas Width",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.zoom_mode,
-                                ZoomMode::FixedTileSize,
-                                "Fixed Tile Size",
-                            );
+                                ZoomMode::ZoomByCanvas,
+                                ZoomMode::ZoomBySize,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.draft.zoom_mode,
+                                    mode,
+                                    zoom_mode_label(mode),
+                                );
+                            }
                         });
 
                     ui.add_space(10.0);
                     match self.draft.zoom_mode {
+                        ZoomMode::Auto => {}
                         ZoomMode::ZoomByRatio => {
                             ui.label("Ratio");
                             ui.add(
@@ -1191,7 +1234,7 @@ impl EzThumbApp {
                                     .suffix("%"),
                             );
                         }
-                        ZoomMode::CanvasWidth => {
+                        ZoomMode::ZoomByCanvas => {
                             ui.label("Width");
                             ui.add(
                                 egui::DragValue::new(&mut self.draft.canvas_width)
@@ -1199,7 +1242,7 @@ impl EzThumbApp {
                                     .suffix(" px"),
                             );
                         }
-                        ZoomMode::FixedTileSize => {
+                        ZoomMode::ZoomBySize => {
                             ui.label("Tile");
                             ui.add(
                                 egui::DragValue::new(&mut self.draft.tile_width).range(32..=4096),
@@ -1230,43 +1273,43 @@ impl EzThumbApp {
                 indented_form_row(ui, "Find Media Duration By", |ui| {
                     egui::ComboBox::from_id_salt("duration_scan_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(match self.draft.config.duration_scan {
-                            DurationScanMode::FastScan => "Fast Scan",
-                            DurationScanMode::DeepProbe => "Deep Probe",
-                        })
+                        .selected_text(duration_scan_label(self.draft.config.duration_scan))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.draft.config.duration_scan,
+                            for mode in [
+                                DurationScanMode::Auto,
                                 DurationScanMode::FastScan,
-                                "Fast Scan",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.config.duration_scan,
-                                DurationScanMode::DeepProbe,
-                                "Deep Probe",
-                            );
+                                DurationScanMode::FullScan,
+                                DurationScanMode::FileHead,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.draft.config.duration_scan,
+                                    mode,
+                                    duration_scan_label(mode),
+                                );
+                            }
                         });
                 });
 
                 indented_form_row(ui, "Media Process Method", |ui| {
                     egui::ComboBox::from_id_salt("process_method_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(if self.draft.config.accurate_seek {
-                            "Frame by Frame (Accurate)"
-                        } else {
-                            "Upon Key Frames (Fast)"
-                        })
+                        .selected_text(process_method_label(self.draft.config.process_method))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.draft.config.accurate_seek,
-                                false,
-                                "Upon Key Frames (Fast)",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.config.accurate_seek,
-                                true,
-                                "Frame by Frame (Accurate)",
-                            );
+                            for method in [
+                                ProcessMethod::Auto,
+                                ProcessMethod::UponKeyFrames,
+                                ProcessMethod::FrameByFrame,
+                                ProcessMethod::SinglePass,
+                                ProcessMethod::TwoPass,
+                                ProcessMethod::SafeMode,
+                                ProcessMethod::KeyFrameRip,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.draft.config.process_method,
+                                    method,
+                                    process_method_label(method),
+                                );
+                            }
                         });
                 });
 
@@ -1282,57 +1325,86 @@ impl EzThumbApp {
 
                 // Section 3: Font
                 section_header(ui, "Font");
+                let font_display = self.selected_font_display();
                 indented_form_row(ui, "Choose Font", |ui| {
-                    egui::ComboBox::from_id_salt("font_mode_combo")
+                    egui::ComboBox::from_id_salt("font_source_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(if self.draft.use_custom_font {
-                            "Custom Font File"
-                        } else {
-                            "System Default"
-                        })
+                        .selected_text(font_source_label(self.draft.config.font_source))
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_value(
-                                    &mut self.draft.use_custom_font,
-                                    false,
-                                    "System Default",
-                                )
-                                .changed()
-                            {
-                                self.draft.config.font_path = None;
+                            for src in [
+                                FontSource::SystemDefault,
+                                FontSource::SystemFont,
+                                FontSource::CustomFile,
+                            ] {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.draft.config.font_source,
+                                        src,
+                                        font_source_label(src),
+                                    )
+                                    .changed()
+                                {
+                                    match src {
+                                        FontSource::SystemDefault => {
+                                            self.draft.config.font_path = None;
+                                        }
+                                        FontSource::SystemFont => {
+                                            if self.draft.config.font_path.is_none() {
+                                                if let Some(first) = self.system_fonts.first() {
+                                                    self.draft.config.font_path =
+                                                        Some(first.path.clone());
+                                                }
+                                            }
+                                        }
+                                        FontSource::CustomFile => {}
+                                    }
+                                }
                             }
-                            ui.selectable_value(
-                                &mut self.draft.use_custom_font,
-                                true,
-                                "Custom Font File",
-                            );
                         });
 
-                    if self.draft.use_custom_font {
-                        ui.add_space(8.0);
-                        if ui.button("Browse...").clicked() {
-                            let mut dlg = rfd::FileDialog::new()
-                                .add_filter("TrueType / OpenType", &["ttf", "otf"]);
-                            let win_fonts = Path::new(r"C:\Windows\Fonts");
-                            if win_fonts.is_dir() {
-                                dlg = dlg.set_directory(win_fonts);
-                            }
-                            if let Some(font_file) = dlg.pick_file() {
-                                self.draft.config.font_path = Some(font_file);
+                    match self.draft.config.font_source {
+                        FontSource::SystemDefault => {}
+                        FontSource::SystemFont => {
+                            ui.add_space(8.0);
+                            egui::ComboBox::from_id_salt("installed_font_combo")
+                                .width(270.0)
+                                .selected_text(&font_display)
+                                .show_ui(ui, |ui| {
+                                    if self.system_fonts.is_empty() {
+                                        ui.label("No system fonts found");
+                                    } else {
+                                        for entry in &self.system_fonts {
+                                            let selected = self.draft.config.font_path.as_ref()
+                                                == Some(&entry.path);
+                                            if ui
+                                                .selectable_label(selected, &entry.display_name)
+                                                .clicked()
+                                            {
+                                                self.draft.config.font_path =
+                                                    Some(entry.path.clone());
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                        FontSource::CustomFile => {
+                            ui.add_space(8.0);
+                            if ui.button("Browse...").clicked() {
+                                let mut dlg = rfd::FileDialog::new()
+                                    .add_filter("TrueType / OpenType", &["ttf", "otf"]);
+                                let win_fonts = Path::new(r"C:\Windows\Fonts");
+                                if win_fonts.is_dir() {
+                                    dlg = dlg.set_directory(win_fonts);
+                                }
+                                if let Some(font_file) = dlg.pick_file() {
+                                    self.draft.config.font_path = Some(font_file);
+                                }
                             }
                         }
                     }
                 });
 
                 indented_form_row(ui, "", |ui| {
-                    let font_display = match &self.draft.config.font_path {
-                        Some(p) => p
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("Custom Font")
-                            .to_string(),
-                        None => "Segoe UI (Default)".to_string(),
-                    };
                     let mut readonly =
                         format!("{font_display}, {}", self.draft.config.info_font_size);
                     ui.add_enabled(
@@ -1443,27 +1515,20 @@ impl EzThumbApp {
                 indented_form_row(ui, "Existing Thumbnails", |ui| {
                     egui::ComboBox::from_id_salt("conflict_policy_combo")
                         .width(COMBO_WIDTH)
-                        .selected_text(match self.draft.config.conflict_policy {
-                            ConflictPolicy::Copy => "Keep Copy (.1, .2)",
-                            ConflictPolicy::Overwrite => "Overwrite Existing Thumbnails",
-                            ConflictPolicy::Skip => "Skip Existing Thumbnails",
-                        })
+                        .selected_text(conflict_policy_label(self.draft.config.conflict_policy))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.draft.config.conflict_policy,
+                            for policy in [
+                                ConflictPolicy::CreateNew,
                                 ConflictPolicy::Copy,
-                                "Keep Copy (.1, .2)",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.config.conflict_policy,
                                 ConflictPolicy::Overwrite,
-                                "Overwrite Existing Thumbnails",
-                            );
-                            ui.selectable_value(
-                                &mut self.draft.config.conflict_policy,
                                 ConflictPolicy::Skip,
-                                "Skip Existing Thumbnails",
-                            );
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.draft.config.conflict_policy,
+                                    policy,
+                                    conflict_policy_label(policy),
+                                );
+                            }
                         });
                 });
 
@@ -1477,23 +1542,23 @@ impl EzThumbApp {
                     egui::ComboBox::from_id_salt("save_picture_combo")
                         .width(COMBO_WIDTH)
                         .selected_text(match fmt_idx {
-                            0 => "Jpeg",
-                            1 => "Png",
-                            2 => "Gif",
-                            _ => "Animated Gif",
+                            0 => "JPEG",
+                            1 => "PNG",
+                            2 => "GIF",
+                            _ => "Animated GIF",
                         })
                         .show_ui(ui, |ui| {
-                            if ui.selectable_value(&mut fmt_idx, 0, "Jpeg").changed() {
-                                self.draft.config.format = OutputFormat::Jpeg { quality: 85 };
+                            if ui.selectable_value(&mut fmt_idx, 0, "JPEG").changed() {
+                                self.draft.config.format = OutputFormat::Jpeg { quality: 95 };
                             }
-                            if ui.selectable_value(&mut fmt_idx, 1, "Png").changed() {
+                            if ui.selectable_value(&mut fmt_idx, 1, "PNG").changed() {
                                 self.draft.config.format = OutputFormat::Png;
                             }
-                            if ui.selectable_value(&mut fmt_idx, 2, "Gif").changed() {
+                            if ui.selectable_value(&mut fmt_idx, 2, "GIF").changed() {
                                 self.draft.config.format = OutputFormat::Gif;
                             }
                             if ui
-                                .selectable_value(&mut fmt_idx, 3, "Animated Gif")
+                                .selectable_value(&mut fmt_idx, 3, "Animated GIF")
                                 .changed()
                             {
                                 self.draft.config.format =
@@ -1513,6 +1578,8 @@ impl EzThumbApp {
                         OutputFormat::AnimatedGif { ref mut delay_ms } => {
                             ui.label("Delay (ms)");
                             ui.add(egui::DragValue::new(delay_ms).range(50..=5000));
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut self.draft.config.transparent_bg, "Transparent");
                         }
                     }
                 });
@@ -1614,7 +1681,9 @@ impl EzThumbApp {
                             .size(24.0 * FONT_SCALE),
                     );
                     ui.add_space(4.0);
-                    ui.label("A video thumbnail contact-sheet generator built in Rust with FFmpeg.");
+                    ui.label(
+                        "A video thumbnail contact-sheet generator built in Rust with FFmpeg.",
+                    );
 
                     ui.add_space(10.0);
                     ui.label("Rust Port Maintainer: Aaron Christopher Ramos");
@@ -1633,7 +1702,9 @@ impl EzThumbApp {
 
                     ui.add_space(12.0);
                     ui.label(RichText::new("External Media Backend").strong());
-                    ui.label("Video probing and frame extraction invoke external FFmpeg and FFprobe:");
+                    ui.label(
+                        "Video probing and frame extraction invoke external FFmpeg and FFprobe:",
+                    );
                     ui.hyperlink_to("https://www.ffmpeg.org", "https://www.ffmpeg.org");
                     ui.add_space(2.0);
                     let ff_text = match &self.ffmpeg_path {
@@ -1684,7 +1755,6 @@ impl eframe::App for EzThumbApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
 
-        // Accept video files dropped onto the application window.
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1847,6 +1917,64 @@ fn color_hex_field(ui: &mut Ui, label: &str, hex: &mut String) {
     ui.add(egui::TextEdit::singleline(hex).desired_width(82.0));
 }
 
+fn grid_setting_label(mode: GridSetting) -> &'static str {
+    match mode {
+        GridSetting::Auto => "Auto",
+        GridSetting::ColumnAndRow => "Column and Row",
+        GridSetting::ColumnAndStep => "Column and Step (Time Step)",
+        GridSetting::DiscreteByNumber => "Discrete by Number (Separate Frames)",
+        GridSetting::DiscreteByStep => "Discrete by Step",
+        GridSetting::DiscreteKeyFrames => "Discrete Key Frames",
+    }
+}
+
+fn zoom_mode_label(mode: ZoomMode) -> &'static str {
+    match mode {
+        ZoomMode::Auto => "Auto",
+        ZoomMode::ZoomByRatio => "Zoom by Ratio",
+        ZoomMode::ZoomByCanvas => "Zoom by Canvas (Canvas Width)",
+        ZoomMode::ZoomBySize => "Zoom by Size (Fixed Tile Size)",
+    }
+}
+
+fn duration_scan_label(mode: DurationScanMode) -> &'static str {
+    match mode {
+        DurationScanMode::Auto => "Auto",
+        DurationScanMode::FastScan => "Fast Scan",
+        DurationScanMode::FullScan => "Full Scan (Deep Probe)",
+        DurationScanMode::FileHead => "File Head",
+    }
+}
+
+fn process_method_label(method: ProcessMethod) -> &'static str {
+    match method {
+        ProcessMethod::Auto => "Auto",
+        ProcessMethod::UponKeyFrames => "Upon Key Frames (Fast)",
+        ProcessMethod::FrameByFrame => "Frame by Frame (Accurate)",
+        ProcessMethod::SinglePass => "Single Pass",
+        ProcessMethod::TwoPass => "Two Pass",
+        ProcessMethod::SafeMode => "Safe Mode",
+        ProcessMethod::KeyFrameRip => "Key Frame Rip",
+    }
+}
+
+fn font_source_label(source: FontSource) -> &'static str {
+    match source {
+        FontSource::SystemDefault => "System Default",
+        FontSource::SystemFont => "Choose From System",
+        FontSource::CustomFile => "Custom Font File",
+    }
+}
+
+fn conflict_policy_label(policy: ConflictPolicy) -> &'static str {
+    match policy {
+        ConflictPolicy::CreateNew => "Create New Thumbnails",
+        ConflictPolicy::Copy => "Keep Copy (.1, .2)",
+        ConflictPolicy::Overwrite => "Overwrite Existing Thumbnails",
+        ConflictPolicy::Skip => "Skip Existing Thumbnails",
+    }
+}
+
 fn position_label(pos: TextPosition) -> &'static str {
     match pos {
         TextPosition::LeftTop => "Top Left",
@@ -1957,8 +2085,15 @@ mod tests {
     }
 
     #[test]
-    fn formats_queue_footer_for_grid_and_zoom_modes() {
+    fn formats_queue_footer_for_auto_and_custom_modes() {
+        let def = EzConfig::default();
+        assert_eq!(
+            format_queue_footer(&def),
+            "Grid: Auto  |  Zoom: Auto  |  Duration: Auto"
+        );
+
         let mut cfg = EzConfig {
+            grid_setting: GridSetting::ColumnAndRow,
             grid: GridSpec { cols: 3, rows: 3 },
             size: SizeSpec::ZoomPercent(50),
             duration_scan: DurationScanMode::FastScan,
@@ -1969,15 +2104,23 @@ mod tests {
             "Grid: 3x3  |  Zoom to 50%  |  Fast Scan"
         );
 
-        cfg.grid = GridSpec { cols: 0, rows: 12 };
+        cfg.grid_setting = GridSetting::DiscreteByStep;
+        cfg.timestep_ms = Some(15_000);
         cfg.size = SizeSpec::TilePixels {
             width: 320,
             height: 180,
         };
-        cfg.duration_scan = DurationScanMode::DeepProbe;
+        cfg.duration_scan = DurationScanMode::FullScan;
         assert_eq!(
             format_queue_footer(&cfg),
-            "Separate: 12 frames  |  Tile 320x180  |  Deep Probe"
+            "Discrete: Every 15s  |  Size 320x180  |  Full Scan"
+        );
+
+        cfg.grid_setting = GridSetting::DiscreteKeyFrames;
+        cfg.duration_scan = DurationScanMode::FileHead;
+        assert_eq!(
+            format_queue_footer(&cfg),
+            "Discrete: Key Frames  |  Size 320x180  |  File Head"
         );
     }
 

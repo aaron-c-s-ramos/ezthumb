@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 use crate::config::{
-    ConflictPolicy, EzConfig, GridSpec, OutputFormat, RgbColor, SizeSpec, SizeUnit, TextPosition,
-    TimeSpec,
+    ConflictPolicy, EzConfig, FontSource, GridSetting, GridSpec, OutputFormat, ProcessMethod,
+    RgbColor, SizeSpec, SizeUnit, TextPosition, TimeSpec,
 };
 use crate::gui::run_gui;
 use crate::probe::probe_video;
@@ -39,10 +39,10 @@ pub fn help_text() -> &'static str {
 Run with no input paths or pass -G / --gui to open the desktop GUI.\n\
 \n\
 OPTIONS:\n\
-  -g, --grid CxR            Grid columns x rows (default 4x4, 0xN saves separate files)\n\
-  -w, --width PIXELS        Total canvas width in pixels (default 1280)\n\
-  -s, --ssize WxH|NN%       Per-tile size in pixels or percentage zoom\n\
-  -m, --format FMT          Output format: jpg[@Q] (default jpg@85), png, gif[@MS]\n\
+  -g, --grid CxR            Grid columns x rows (default auto, 0xN saves separate files)\n\
+  -w, --width PIXELS        Total canvas width in pixels\n\
+  -s, --ssize WxH|NN%|auto  Per-tile size in pixels, percentage zoom, or auto\n\
+  -m, --format FMT          Output format: jpg[@Q] (default jpg@95), png, gif[@MS]\n\
   -t, --timestep MS         Fixed interval between screenshots in milliseconds\n\
   -o, --outdir DIR          Directory for output images (default: source folder)\n\
   -x, --suffix TEXT         Filename suffix (default _thumb)\n\
@@ -57,7 +57,7 @@ OPTIONS:\n\
       --filter EXT1,EXT2    Comma-separated allowed video extensions\n\
       --accurate            Use slower frame-accurate FFmpeg seek\n\
       --transparent         Transparent background for PNG and GIF outputs\n\
-      --override MODE       Existing file policy: copy (default), on, off\n\
+      --override MODE       Existing file policy: new (default), copy, on, off\n\
       --opt-info VAL        Media info header: on, off, lt, mt, rt\n\
       --opt-time VAL        Inset timestamp: on, off, lt, mt, rt, lb, mb, rb\n\
       --opt-ffr on|off      Start capture at first frame (default off)\n\
@@ -106,11 +106,19 @@ pub fn parse_args(args: &[String], config: &mut EzConfig) -> Result<CliAction, S
             "-i" | "--info" | "--list" => info_short = true,
             "-I" | "--inside" => info_detail = true,
             "-R" | "--recursive" => config.recursive = true,
-            "--accurate" => config.accurate_seek = true,
+            "--accurate" => {
+                config.accurate_seek = true;
+                config.process_method = ProcessMethod::FrameByFrame;
+            }
             "--transparent" => config.transparent_bg = true,
             "-g" | "--grid" => {
                 let val = next_val(&mut idx, arg)?;
                 config.grid = GridSpec::parse(&val).map_err(|e| e.to_string())?;
+                config.grid_setting = if config.grid.is_individual() {
+                    GridSetting::DiscreteByNumber
+                } else {
+                    GridSetting::ColumnAndRow
+                };
             }
             "-w" | "--width" => {
                 let val = next_val(&mut idx, arg)?;
@@ -131,6 +139,13 @@ pub fn parse_args(args: &[String], config: &mut EzConfig) -> Result<CliAction, S
                     .parse()
                     .map_err(|_| format!("Invalid timestep '{val}'."))?;
                 config.timestep_ms = if ms == 0 { None } else { Some(ms) };
+                if ms > 0 {
+                    config.grid_setting = if config.grid.is_individual() {
+                        GridSetting::DiscreteByStep
+                    } else {
+                        GridSetting::ColumnAndStep
+                    };
+                }
             }
             "-o" | "--outdir" => {
                 let val = next_val(&mut idx, arg)?;
@@ -159,6 +174,7 @@ pub fn parse_args(args: &[String], config: &mut EzConfig) -> Result<CliAction, S
             }
             "-f" | "--font" => {
                 let val = next_val(&mut idx, arg)?;
+                config.font_source = FontSource::CustomFile;
                 config.font_path = Some(PathBuf::from(val));
             }
             "-F" | "--fontsize" => {

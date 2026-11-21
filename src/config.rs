@@ -126,9 +126,30 @@ impl GridSpec {
     }
 }
 
+/// Selects the high-level grid and frame-sampling profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GridSetting {
+    /// Automatically chooses columns and rows from video duration.
+    #[default]
+    Auto,
+    /// Fixed columns x rows contact sheet.
+    ColumnAndRow,
+    /// Fixed columns with shots spaced every X seconds.
+    ColumnAndStep,
+    /// Fixed count of separate numbered image files.
+    DiscreteByNumber,
+    /// Separate numbered image files spaced every X seconds.
+    DiscreteByStep,
+    /// Separate numbered image files extracted from video key frames (I-frames).
+    DiscreteKeyFrames,
+}
+
 /// Selects how thumbnail dimensions are calculated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SizeSpec {
+    /// Automatically selects thumbnail dimensions from video resolution and layout.
+    #[default]
+    Auto,
     /// Fixed total canvas width in pixels (thumbnail width derives from columns and gaps).
     CanvasWidth(u32),
     /// Fixed dimensions per thumbnail tile in pixels.
@@ -137,16 +158,13 @@ pub enum SizeSpec {
     ZoomPercent(u32),
 }
 
-impl Default for SizeSpec {
-    fn default() -> Self {
-        Self::CanvasWidth(1280)
-    }
-}
-
 impl SizeSpec {
     /// Parses WxH pixel dimensions or NN% zoom ratio.
     pub fn parse_ssize(input: &str) -> Result<Self, ConfigError> {
         let trimmed = input.trim().to_ascii_lowercase();
+        if trimmed == "auto" {
+            return Ok(Self::Auto);
+        }
         if let Some(pct_str) = trimmed.strip_suffix('%') {
             let pct: u32 = pct_str
                 .trim()
@@ -186,7 +204,7 @@ pub enum OutputFormat {
 
 impl Default for OutputFormat {
     fn default() -> Self {
-        Self::Jpeg { quality: 85 }
+        Self::Jpeg { quality: 95 }
     }
 }
 
@@ -210,7 +228,7 @@ impl OutputFormat {
             }
         } else {
             match lower.as_str() {
-                "jpg" | "jpeg" => Ok(Self::Jpeg { quality: 85 }),
+                "jpg" | "jpeg" => Ok(Self::Jpeg { quality: 95 }),
                 "png" => Ok(Self::Png),
                 "gif" => Ok(Self::Gif),
                 _ => Err(ConfigError::InvalidFormat(input.to_string())),
@@ -229,8 +247,11 @@ impl OutputFormat {
 }
 
 /// Defines how existing output files are handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ConflictPolicy {
+    /// Appends _1 .. _255 before the extension to create a new thumbnail file.
+    #[default]
+    CreateNew,
     /// Appends .1 .. .255 before the extension when the output file exists.
     Copy,
     /// Replaces existing output files in place.
@@ -240,9 +261,10 @@ pub enum ConflictPolicy {
 }
 
 impl ConflictPolicy {
-    /// Parses on, off, or copy values from CLI flags.
+    /// Parses new, copy, on, or off values from CLI flags.
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
         match input.trim().to_ascii_lowercase().as_str() {
+            "new" | "create" | "createnew" => Ok(Self::CreateNew),
             "on" | "yes" | "true" | "overwrite" => Ok(Self::Overwrite),
             "off" | "no" | "false" | "skip" => Ok(Self::Skip),
             "copy" => Ok(Self::Copy),
@@ -397,17 +419,55 @@ pub enum ThemeMode {
 /// Selects how FFprobe inspects media duration and stream headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DurationScanMode {
-    /// Standard header-level FFprobe metadata inspection.
+    /// Runs fast scan first and falls back to full scan when duration is absent.
     #[default]
+    Auto,
+    /// Standard header-level FFprobe metadata inspection.
     FastScan,
     /// Extended FFprobe analyze duration and probe size for complex containers.
-    DeepProbe,
+    #[serde(alias = "DeepProbe")]
+    FullScan,
+    /// Minimal header-head read with small probe size and analyze duration.
+    FileHead,
+}
+
+/// Selects how FFmpeg seeks and decodes frames during thumbnail extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProcessMethod {
+    /// Fast input seek with automatic accurate retry fallback.
+    #[default]
+    Auto,
+    /// Fast keyframe-aligned input seek before -i.
+    UponKeyFrames,
+    /// Frame-accurate output seek after -i.
+    FrameByFrame,
+    /// Single-pass FFmpeg extraction for sequential streams.
+    SinglePass,
+    /// Hybrid coarse input seek followed by fine output seek.
+    TwoPass,
+    /// Single-threaded error-tolerant accurate decode for damaged media.
+    SafeMode,
+    /// Extracts nearest key frames directly with -skip_frame nokey.
+    KeyFrameRip,
+}
+
+/// Selects the font source used for thumbnail text overlays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FontSource {
+    /// Uses the built-in system fallback chain.
+    #[default]
+    SystemDefault,
+    /// Uses a font chosen from installed operating system font directories.
+    SystemFont,
+    /// Uses an explicit custom TrueType or OpenType font file path.
+    CustomFile,
 }
 
 /// Stores all persisted and runtime EzThumb configuration values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EzConfig {
+    pub grid_setting: GridSetting,
     pub grid: GridSpec,
     pub size: SizeSpec,
     pub format: OutputFormat,
@@ -418,6 +478,7 @@ pub struct EzConfig {
     pub include_first_frame: bool,
     pub include_last_frame: bool,
     pub accurate_seek: bool,
+    pub process_method: ProcessMethod,
     pub duration_scan: DurationScanMode,
     pub show_info: bool,
     pub info_position: TextPosition,
@@ -425,6 +486,7 @@ pub struct EzConfig {
     pub timestamp_position: TextPosition,
     pub info_font_size: u32,
     pub timestamp_font_size: u32,
+    pub font_source: FontSource,
     pub font_path: Option<PathBuf>,
     pub gap_px: u32,
     pub margin_px: u32,
@@ -446,8 +508,9 @@ pub struct EzConfig {
 impl Default for EzConfig {
     fn default() -> Self {
         Self {
+            grid_setting: GridSetting::Auto,
             grid: GridSpec::default(),
-            size: SizeSpec::default(),
+            size: SizeSpec::Auto,
             format: OutputFormat::default(),
             transparent_bg: false,
             timestep_ms: None,
@@ -456,13 +519,15 @@ impl Default for EzConfig {
             include_first_frame: false,
             include_last_frame: false,
             accurate_seek: false,
-            duration_scan: DurationScanMode::FastScan,
+            process_method: ProcessMethod::Auto,
+            duration_scan: DurationScanMode::Auto,
             show_info: true,
             info_position: TextPosition::LeftTop,
             show_timestamp: true,
             timestamp_position: TextPosition::RightBottom,
             info_font_size: 16,
             timestamp_font_size: 14,
+            font_source: FontSource::SystemDefault,
             font_path: None,
             gap_px: 4,
             margin_px: 8,
@@ -472,7 +537,7 @@ impl Default for EzConfig {
             timestamp_color: RgbColor::new(255, 255, 255),
             suffix: "_thumb".to_string(),
             outdir: None,
-            conflict_policy: ConflictPolicy::Copy,
+            conflict_policy: ConflictPolicy::CreateNew,
             size_unit: SizeUnit::Auto,
             video_stream_index: None,
             recursive: false,
@@ -487,6 +552,57 @@ impl Default for EzConfig {
 }
 
 impl EzConfig {
+    /// Returns true when frames save as separate numbered image files.
+    pub fn is_discrete_output(&self) -> bool {
+        match self.grid_setting {
+            GridSetting::DiscreteByNumber
+            | GridSetting::DiscreteByStep
+            | GridSetting::DiscreteKeyFrames => true,
+            GridSetting::ColumnAndRow => self.grid.is_individual(),
+            GridSetting::Auto | GridSetting::ColumnAndStep => false,
+        }
+    }
+
+    /// Resolves effective columns and rows for a video duration.
+    pub fn resolved_grid(&self, duration_ms: u64) -> GridSpec {
+        match self.grid_setting {
+            GridSetting::Auto => {
+                if duration_ms <= 60_000 {
+                    GridSpec { cols: 2, rows: 2 }
+                } else if duration_ms <= 300_000 {
+                    GridSpec { cols: 3, rows: 3 }
+                } else if duration_ms <= 1_200_000 {
+                    GridSpec { cols: 4, rows: 4 }
+                } else if duration_ms <= 3_600_000 {
+                    GridSpec { cols: 4, rows: 5 }
+                } else {
+                    GridSpec { cols: 4, rows: 6 }
+                }
+            }
+            GridSetting::ColumnAndRow => self.grid,
+            GridSetting::ColumnAndStep => GridSpec {
+                cols: self.grid.cols.max(1),
+                rows: self.grid.rows.max(1),
+            },
+            GridSetting::DiscreteByNumber => GridSpec {
+                cols: 0,
+                rows: self.grid.rows.max(1),
+            },
+            GridSetting::DiscreteByStep | GridSetting::DiscreteKeyFrames => {
+                GridSpec { cols: 0, rows: 200 }
+            }
+        }
+    }
+
+    /// Resolves the active processing method while respecting legacy accurate_seek.
+    pub fn effective_process_method(&self) -> ProcessMethod {
+        if self.accurate_seek && self.process_method == ProcessMethod::Auto {
+            ProcessMethod::FrameByFrame
+        } else {
+            self.process_method
+        }
+    }
+
     /// Returns the default per-user configuration file path.
     pub fn config_file_path() -> PathBuf {
         #[cfg(windows)]
@@ -567,12 +683,37 @@ mod tests {
             OutputFormat::parse("jpg@92").unwrap(),
             OutputFormat::Jpeg { quality: 92 }
         );
+        assert_eq!(
+            OutputFormat::parse("jpg").unwrap(),
+            OutputFormat::Jpeg { quality: 95 }
+        );
         assert_eq!(OutputFormat::parse("png").unwrap(), OutputFormat::Png);
         assert_eq!(
             OutputFormat::parse("gif@750").unwrap(),
             OutputFormat::AnimatedGif { delay_ms: 750 }
         );
         assert!(OutputFormat::parse("bmp").is_err());
+    }
+
+    #[test]
+    fn defaults_match_requested_auto_and_jpeg_95_profiles() {
+        let cfg = EzConfig::default();
+        assert_eq!(cfg.grid_setting, GridSetting::Auto);
+        assert_eq!(cfg.size, SizeSpec::Auto);
+        assert_eq!(cfg.duration_scan, DurationScanMode::Auto);
+        assert_eq!(cfg.process_method, ProcessMethod::Auto);
+        assert_eq!(cfg.font_source, FontSource::SystemDefault);
+        assert_eq!(cfg.conflict_policy, ConflictPolicy::CreateNew);
+        assert_eq!(cfg.format, OutputFormat::Jpeg { quality: 95 });
+    }
+
+    #[test]
+    fn resolves_auto_grid_by_video_duration() {
+        let cfg = EzConfig::default();
+        assert_eq!(cfg.resolved_grid(45_000), GridSpec { cols: 2, rows: 2 });
+        assert_eq!(cfg.resolved_grid(180_000), GridSpec { cols: 3, rows: 3 });
+        assert_eq!(cfg.resolved_grid(900_000), GridSpec { cols: 4, rows: 4 });
+        assert_eq!(cfg.resolved_grid(5_400_000), GridSpec { cols: 4, rows: 6 });
     }
 
     #[test]

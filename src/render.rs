@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -8,10 +9,180 @@ use image::codecs::gif::{GifEncoder, Repeat};
 use image::codecs::jpeg::JpegEncoder;
 use image::{Delay, DynamicImage, Frame, ImageFormat, Rgba, RgbaImage};
 use thiserror::Error;
+use walkdir::WalkDir;
 
 use crate::config::{ConflictPolicy, EzConfig, OutputFormat, TextPosition};
 use crate::ffmpeg::{extract_frames, CapturedFrame, FfmpegError};
 use crate::probe::{format_timestamp_hms, probe_video_with_mode, MediaInfo, ProbeError};
+
+/// Represents an installed operating system TrueType or OpenType font.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemFontEntry {
+    pub display_name: String,
+    pub path: PathBuf,
+}
+
+/// Scans standard OS font directories and returns installed TTF/OTF fonts sorted by name.
+pub fn discover_system_fonts() -> Vec<SystemFontEntry> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        if let Some(windir) = std::env::var_os("WINDIR") {
+            dirs.push(PathBuf::from(windir).join("Fonts"));
+        } else {
+            dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Fonts"),
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        dirs.push(PathBuf::from("/System/Library/Fonts"));
+        dirs.push(PathBuf::from("/Library/Fonts"));
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join("Library").join("Fonts"));
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        dirs.push(PathBuf::from("/usr/share/fonts"));
+        dirs.push(PathBuf::from("/usr/local/share/fonts"));
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(".local/share/fonts"));
+            dirs.push(PathBuf::from(home).join(".fonts"));
+        }
+    }
+
+    let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(dir).max_depth(3).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.into_path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            if !matches!(ext.as_deref(), Some("ttf" | "otf")) {
+                continue;
+            }
+            let name = read_opentype_display_name(&path).unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Font")
+                    .to_string()
+            });
+            by_name.entry(name).or_insert(path);
+        }
+    }
+
+    by_name
+        .into_iter()
+        .map(|(display_name, path)| SystemFontEntry { display_name, path })
+        .collect()
+}
+
+/// Reads the Full Font Name (ID 4) or Family Name (ID 1) from an OpenType name table.
+fn read_opentype_display_name(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    if data.len() < 12 {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let mut name_offset = None;
+    let mut name_len = 0usize;
+    for i in 0..num_tables {
+        let rec = 12 + i * 16;
+        if rec + 16 > data.len() {
+            break;
+        }
+        if &data[rec..rec + 4] == b"name" {
+            name_offset = Some(u32::from_be_bytes([
+                data[rec + 8],
+                data[rec + 9],
+                data[rec + 10],
+                data[rec + 11],
+            ]) as usize);
+            name_len = u32::from_be_bytes([
+                data[rec + 12],
+                data[rec + 13],
+                data[rec + 14],
+                data[rec + 15],
+            ]) as usize;
+            break;
+        }
+    }
+
+    let base = name_offset?;
+    if base + 6 > data.len() || base + name_len > data.len() {
+        return None;
+    }
+    let count = u16::from_be_bytes([data[base + 2], data[base + 3]]) as usize;
+    let str_storage = base + u16::from_be_bytes([data[base + 4], data[base + 5]]) as usize;
+
+    let mut full_name: Option<String> = None;
+    let mut family_name: Option<String> = None;
+
+    for i in 0..count {
+        let rec = base + 6 + i * 12;
+        if rec + 12 > data.len() {
+            break;
+        }
+        let platform_id = u16::from_be_bytes([data[rec], data[rec + 1]]);
+        let name_id = u16::from_be_bytes([data[rec + 6], data[rec + 7]]);
+        if name_id != 4 && name_id != 1 {
+            continue;
+        }
+        let len = u16::from_be_bytes([data[rec + 8], data[rec + 9]]) as usize;
+        let off = u16::from_be_bytes([data[rec + 10], data[rec + 11]]) as usize;
+        let start = str_storage + off;
+        let end = start + len;
+        if end > data.len() {
+            continue;
+        }
+        let slice = &data[start..end];
+        let decoded = if platform_id == 3 || platform_id == 0 {
+            if !len.is_multiple_of(2) {
+                continue;
+            }
+            let u16s: Vec<u16> = slice
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
+                .collect();
+            String::from_utf16(&u16s).ok()
+        } else if platform_id == 1 {
+            Some(String::from_utf8_lossy(slice).to_string())
+        } else {
+            None
+        };
+
+        if let Some(text) = decoded {
+            let clean = text.trim().to_string();
+            if clean.is_empty() {
+                continue;
+            }
+            if name_id == 4 && (full_name.is_none() || platform_id == 3) {
+                full_name = Some(clean);
+            } else if name_id == 1 && (family_name.is_none() || platform_id == 3) {
+                family_name = Some(clean);
+            }
+        }
+    }
+
+    full_name.or(family_name)
+}
 
 /// Represents errors produced while composing or writing output images.
 #[derive(Debug, Error)]
@@ -70,6 +241,15 @@ pub fn resolve_output_path(
     }
 
     match config.conflict_policy {
+        ConflictPolicy::CreateNew => {
+            for serial in 1..=255u16 {
+                let candidate = parent.join(format!("{base_name}_{serial}.{ext}"));
+                if !candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+            }
+            Ok(Some(parent.join(format!("{base_name}_255.{ext}"))))
+        }
         ConflictPolicy::Overwrite => Ok(Some(primary)),
         ConflictPolicy::Skip => Ok(None),
         ConflictPolicy::Copy => {
@@ -94,7 +274,7 @@ pub fn process_video<F>(
 where
     F: FnMut(usize, usize),
 {
-    if !config.grid.is_individual()
+    if !config.is_discrete_output()
         && config.conflict_policy == ConflictPolicy::Skip
         && resolve_output_path(path, config, None)?.is_none()
     {
@@ -141,10 +321,21 @@ pub fn save_outputs(
                 if config.show_timestamp {
                     draw_timestamp_on_tile(&mut img, f.timestamp_ms, config, font.as_ref());
                 }
-                img
+                if config.transparent_bg {
+                    let pad = config.margin_px.max(2);
+                    let mut padded = RgbaImage::from_pixel(
+                        img.width() + pad * 2,
+                        img.height() + pad * 2,
+                        Rgba([0, 0, 0, 0]),
+                    );
+                    blit_image(&mut padded, &img, pad, pad);
+                    padded
+                } else {
+                    img
+                }
             })
             .collect();
-        write_animated_gif(&out_path, &stamped, delay_ms)?;
+        write_animated_gif(&out_path, &stamped, delay_ms, config.transparent_bg)?;
         return Ok(RenderOutcome {
             output_paths: vec![out_path],
             preview_image: stamped.into_iter().next(),
@@ -152,7 +343,7 @@ pub fn save_outputs(
         });
     }
 
-    if config.grid.is_individual() {
+    if config.is_discrete_output() {
         let mut paths = Vec::new();
         let mut first_preview = None;
         for (i, frame) in frames.iter().enumerate() {
@@ -208,7 +399,7 @@ fn compose_contact_sheet_with_font(
     config: &EzConfig,
     font: Option<&FontVec>,
 ) -> RgbaImage {
-    let cols = config.grid.cols.max(1);
+    let cols = config.resolved_grid(info.duration_ms).cols.max(1);
     let rows = (frames.len() as u32).div_ceil(cols).max(1);
     let tile_w = frames[0].image.width().max(1);
     let tile_h = frames[0].image.height().max(1);
@@ -376,13 +567,24 @@ fn write_animated_gif(
     out_path: &Path,
     frames: &[RgbaImage],
     delay_ms: u32,
+    transparent_bg: bool,
 ) -> Result<(), RenderError> {
     let file = File::create(out_path)?;
     let mut encoder = GifEncoder::new(BufWriter::new(file));
     encoder.set_repeat(Repeat::Infinite)?;
     let delay = Delay::from_numer_denom_ms(delay_ms.max(50), 1);
     for img in frames {
-        encoder.encode_frame(Frame::from_parts(img.clone(), 0, 0, delay))?;
+        let mut frame = Frame::from_parts(img.clone(), 0, 0, delay);
+        if transparent_bg {
+            // Preserve the alpha channel so the GIF encoder writes a transparency layer.
+            encoder.encode_frame(frame)?;
+        } else {
+            // Clear partial transparency to opaque pixels when transparency is disabled.
+            for px in frame.buffer_mut().pixels_mut() {
+                px[3] = 255;
+            }
+            encoder.encode_frame(frame)?;
+        }
     }
     Ok(())
 }
@@ -612,6 +814,7 @@ mod tests {
     #[test]
     fn composes_contact_sheet_with_expected_canvas_dimensions() {
         let cfg = EzConfig {
+            grid_setting: crate::config::GridSetting::ColumnAndRow,
             grid: GridSpec { cols: 2, rows: 2 },
             gap_px: 4,
             margin_px: 8,
@@ -630,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_copy_conflict_policy_with_serial_suffix() {
+    fn resolves_create_new_copy_and_skip_conflict_policies() {
         let dir = std::env::temp_dir().join(format!("ezthumb_conflict_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -639,21 +842,53 @@ mod tests {
         let existing = dir.join("clip_thumb.jpg");
         fs::write(&existing, b"old").unwrap();
 
-        let cfg = EzConfig {
+        let new_cfg = EzConfig {
             outdir: Some(dir.clone()),
-            conflict_policy: ConflictPolicy::Copy,
+            conflict_policy: ConflictPolicy::CreateNew,
             ..Default::default()
         };
-        let next = resolve_output_path(&video, &cfg, None).unwrap().unwrap();
-        assert_eq!(next, dir.join("clip_thumb.1.jpg"));
+        let next_new = resolve_output_path(&video, &new_cfg, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_new, dir.join("clip_thumb_1.jpg"));
+
+        let copy_cfg = EzConfig {
+            conflict_policy: ConflictPolicy::Copy,
+            ..new_cfg.clone()
+        };
+        let next_copy = resolve_output_path(&video, &copy_cfg, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_copy, dir.join("clip_thumb.1.jpg"));
 
         let skip_cfg = EzConfig {
             conflict_policy: ConflictPolicy::Skip,
-            ..cfg
+            ..new_cfg
         };
         assert!(resolve_output_path(&video, &skip_cfg, None)
             .unwrap()
             .is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_transparent_animated_gif() {
+        let dir = std::env::temp_dir().join(format!("ezthumb_anim_gif_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let out_path = dir.join("anim.gif");
+        let mut frame = RgbaImage::from_pixel(24, 24, Rgba([0, 0, 0, 0]));
+        for y in 4..20 {
+            for x in 4..20 {
+                frame.put_pixel(x, y, Rgba([220, 60, 40, 255]));
+            }
+        }
+        write_animated_gif(&out_path, &[frame.clone(), frame], 400, true).unwrap();
+        let bytes = fs::read(&out_path).unwrap();
+        assert!(bytes.starts_with(b"GIF89a"));
+        assert!(bytes.len() > 64);
 
         let _ = fs::remove_dir_all(&dir);
     }

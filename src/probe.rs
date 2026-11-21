@@ -145,23 +145,47 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
 /// Builds ffprobe CLI arguments according to the chosen duration scan mode.
 pub fn build_ffprobe_args(scan_mode: DurationScanMode) -> Vec<&'static str> {
     let mut args = vec!["-v", "error"];
-    if scan_mode == DurationScanMode::DeepProbe {
-        args.extend(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+    match scan_mode {
+        DurationScanMode::FullScan => {
+            args.extend(["-analyzeduration", "100000000", "-probesize", "100000000"]);
+        }
+        DurationScanMode::FileHead => {
+            args.extend(["-analyzeduration", "1000000", "-probesize", "1000000"]);
+        }
+        DurationScanMode::Auto | DurationScanMode::FastScan => {}
     }
     args.extend(["-print_format", "json", "-show_format", "-show_streams"]);
     args
 }
 
-/// Probes a video file using external ffprobe with the default fast header scan.
+/// Probes a video file using external ffprobe with the default Auto scan mode.
 pub fn probe_video(
     path: &Path,
     video_stream_index: Option<usize>,
 ) -> Result<MediaInfo, ProbeError> {
-    probe_video_with_mode(path, video_stream_index, DurationScanMode::FastScan)
+    probe_video_with_mode(path, video_stream_index, DurationScanMode::Auto)
 }
 
 /// Probes a video file using external ffprobe and returns structured metadata.
 pub fn probe_video_with_mode(
+    path: &Path,
+    video_stream_index: Option<usize>,
+    scan_mode: DurationScanMode,
+) -> Result<MediaInfo, ProbeError> {
+    let info = run_ffprobe_once(path, video_stream_index, scan_mode)?;
+    if scan_mode == DurationScanMode::Auto && info.duration_ms == 0 {
+        if let Ok(full_info) =
+            run_ffprobe_once(path, video_stream_index, DurationScanMode::FullScan)
+        {
+            if full_info.duration_ms > 0 {
+                return Ok(full_info);
+            }
+        }
+    }
+    Ok(info)
+}
+
+fn run_ffprobe_once(
     path: &Path,
     video_stream_index: Option<usize>,
     scan_mode: DurationScanMode,
@@ -185,6 +209,55 @@ pub fn probe_video_with_mode(
     let raw_json = String::from_utf8_lossy(&output.stdout);
     let file_size_fs = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     parse_ffprobe_json(path, &raw_json, file_size_fs, video_stream_index)
+}
+
+/// Queries key-frame (I-frame) timestamps in milliseconds using external ffprobe.
+pub fn probe_keyframe_timestamps_ms(
+    path: &Path,
+    video_stream_index: Option<usize>,
+) -> Result<Vec<u64>, ProbeError> {
+    let ffprobe = find_binary("ffprobe").ok_or(ProbeError::FfprobeNotFound)?;
+    let stream_sel = format!("v:{}", video_stream_index.unwrap_or(0));
+    let mut cmd = Command::new(ffprobe);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        &stream_sel,
+        "-skip_frame",
+        "nokey",
+        "-show_entries",
+        "frame=pts_time",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(path);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ProbeError::Failed {
+            path: path.display().to_string(),
+            stderr,
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut times = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim().trim_end_matches(',');
+        if let Ok(secs) = trimmed.parse::<f64>() {
+            if secs >= 0.0 {
+                let ms = (secs * 1000.0).round() as u64;
+                if times.last().copied() != Some(ms) {
+                    times.push(ms);
+                }
+            }
+        }
+    }
+    Ok(times)
 }
 
 #[derive(Debug, Deserialize)]
@@ -415,13 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn builds_ffprobe_args_for_fast_and_deep_modes() {
+    fn builds_ffprobe_args_for_all_duration_scan_modes() {
+        let auto = build_ffprobe_args(DurationScanMode::Auto);
+        assert!(!auto.contains(&"-analyzeduration"));
+        assert!(auto.contains(&"-show_format"));
+
         let fast = build_ffprobe_args(DurationScanMode::FastScan);
         assert!(!fast.contains(&"-analyzeduration"));
-        assert!(fast.contains(&"-show_format"));
 
-        let deep = build_ffprobe_args(DurationScanMode::DeepProbe);
-        assert!(deep.contains(&"-analyzeduration"));
-        assert!(deep.contains(&"-probesize"));
+        let full = build_ffprobe_args(DurationScanMode::FullScan);
+        assert!(full.contains(&"-analyzeduration"));
+        assert!(full.contains(&"100000000"));
+
+        let head = build_ffprobe_args(DurationScanMode::FileHead);
+        assert!(head.contains(&"-probesize"));
+        assert!(head.contains(&"1000000"));
     }
 }

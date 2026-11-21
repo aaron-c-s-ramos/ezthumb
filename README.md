@@ -43,6 +43,33 @@ Running `ezthumb` with no file arguments (or with `-G` / `--gui`) opens the desk
 
 Install **FFmpeg** (`ffmpeg` and `ffprobe`) on your `PATH`, or place `ffmpeg.exe` and `ffprobe.exe` next to `ezthumb.exe`.
 
+## Installation
+
+### Cargo (`crates.io`)
+
+```powershell
+cargo install ezthumb
+```
+
+### Scoop (Personal Bucket)
+
+```powershell
+scoop bucket add aaron https://github.com/aaron-c-s-ramos/scoop-bucket
+scoop install aaron/ezthumb
+```
+
+### WinGet (Windows Package Manager)
+
+```powershell
+winget install --id aaron-c-s-ramos.EzThumb -e
+```
+
+*(Initial community manifest submission is tracked in `microsoft/winget-pkgs#485628`.)*
+
+### Prebuilt Binary (GitHub Releases)
+
+Download the standalone `ezthumb.exe` binary from [GitHub Releases](https://github.com/aaron-c-s-ramos/ezthumb/releases/latest).
+
 ## How to Use
 
 ### Desktop GUI

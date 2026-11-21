@@ -1,0 +1,77 @@
+name: Release Distribution (Crates.io and WinGet)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (for example, v4.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-crates-io:
+    name: Publish to crates.io
+    runs-on: windows-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+
+      - name: Verify Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Run format, test, and clippy checks
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Publish crate to crates.io
+        shell: pwsh
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CARGO_REGISTRY_TOKEN)) {
+            Write-Warning "CARGO_REGISTRY_TOKEN secret is not configured. Skipping crates.io publish."
+            exit 0
+          }
+          cargo publish --locked
+
+  publish-winget:
+    name: Submit update to microsoft/winget-pkgs
+    runs-on: windows-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    steps:
+      - name: Check WINGET_TOKEN secret
+        id: check-token
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
+            Write-Warning "WINGET_TOKEN secret is not configured. Skipping WinGet submission."
+            "configured=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "configured=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Publish to WinGet via WinGet Releaser
+        if: steps.check-token.outputs.configured == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: aaron-c-s-ramos.EzThumb
+          installers-regex: 'ezthumb\.exe$'
+          release-tag: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}
+          fork-user: aaron-c-s-ramos

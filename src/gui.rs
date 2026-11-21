@@ -1919,19 +1919,19 @@ fn color_hex_field(ui: &mut Ui, label: &str, hex: &mut String) {
 
 fn grid_setting_label(mode: GridSetting) -> &'static str {
     match mode {
-        GridSetting::Auto => "Auto",
-        GridSetting::ColumnAndRow => "Column and Row",
+        GridSetting::Auto => "Auto (By Duration)",
+        GridSetting::ColumnAndRow => "Column and Row (Fixed Grid)",
         GridSetting::ColumnAndStep => "Column and Step (Time Step)",
         GridSetting::DiscreteByNumber => "Discrete by Number (Separate Frames)",
-        GridSetting::DiscreteByStep => "Discrete by Step",
-        GridSetting::DiscreteKeyFrames => "Discrete Key Frames",
+        GridSetting::DiscreteByStep => "Discrete by Step (Separate Interval)",
+        GridSetting::DiscreteKeyFrames => "Discrete Key Frames (I-Frames)",
     }
 }
 
 fn zoom_mode_label(mode: ZoomMode) -> &'static str {
     match mode {
-        ZoomMode::Auto => "Auto",
-        ZoomMode::ZoomByRatio => "Zoom by Ratio",
+        ZoomMode::Auto => "Auto (Adaptive Fit)",
+        ZoomMode::ZoomByRatio => "Zoom by Ratio (Percentage)",
         ZoomMode::ZoomByCanvas => "Zoom by Canvas (Canvas Width)",
         ZoomMode::ZoomBySize => "Zoom by Size (Fixed Tile Size)",
     }
@@ -1939,22 +1939,22 @@ fn zoom_mode_label(mode: ZoomMode) -> &'static str {
 
 fn duration_scan_label(mode: DurationScanMode) -> &'static str {
     match mode {
-        DurationScanMode::Auto => "Auto",
-        DurationScanMode::FastScan => "Fast Scan",
+        DurationScanMode::Auto => "Auto (Fast + Fallback)",
+        DurationScanMode::FastScan => "Fast Scan (Metadata)",
         DurationScanMode::FullScan => "Full Scan (Deep Probe)",
-        DurationScanMode::FileHead => "File Head",
+        DurationScanMode::FileHead => "File Head (Minimal Probe)",
     }
 }
 
 fn process_method_label(method: ProcessMethod) -> &'static str {
     match method {
-        ProcessMethod::Auto => "Auto",
+        ProcessMethod::Auto => "Auto (Fast + Retry)",
         ProcessMethod::UponKeyFrames => "Upon Key Frames (Fast)",
         ProcessMethod::FrameByFrame => "Frame by Frame (Accurate)",
-        ProcessMethod::SinglePass => "Single Pass",
-        ProcessMethod::TwoPass => "Two Pass",
-        ProcessMethod::SafeMode => "Safe Mode",
-        ProcessMethod::KeyFrameRip => "Key Frame Rip",
+        ProcessMethod::SinglePass => "Single Pass (Sequential)",
+        ProcessMethod::TwoPass => "Two Pass (Hybrid Seek)",
+        ProcessMethod::SafeMode => "Safe Mode (Error Tolerant)",
+        ProcessMethod::KeyFrameRip => "Key Frame Rip (I-Frames Only)",
     }
 }
 

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::thread;
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Layout, Rect, RichText, Sense, Stroke,
-    Style, TextStyle, Ui, Visuals,
+    self, Align, Color32, ColorImage, CornerRadius, FontId, Frame, IconData, Layout, Rect,
+    RichText, Sense, Stroke, Style, TextStyle, TextureHandle, TextureOptions, Ui, Visuals,
 };
 
 use crate::cli::collect_video_files;
@@ -24,6 +24,18 @@ pub const FONT_SCALE: f32 = 1.5_f32;
 const BASE_HEADER_FONT_SIZE: f32 = 17.0_f32;
 const LABEL_COL_WIDTH: f32 = 245.0_f32;
 const COMBO_WIDTH: f32 = 365.0_f32;
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+/// Decodes the embedded 256x256 PNG application icon for window and taskbar use.
+pub fn load_window_icon() -> Option<IconData> {
+    let rgba = image::load_from_memory(APP_ICON_PNG).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
 
 /// Scales every default egui text style by FONT_SCALE.
 pub fn scaled_text_styles() -> BTreeMap<TextStyle, FontId> {
@@ -96,10 +108,13 @@ pub fn format_queue_footer(config: &EzConfig) -> String {
 
 /// Launches the eframe/egui desktop window.
 pub fn run_gui(initial_files: Vec<PathBuf>, config: EzConfig) -> eframe::Result {
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("EzThumb")
         .with_inner_size([1040.0, 690.0])
         .with_min_inner_size([920.0, 580.0]);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
 
     let options = eframe::NativeOptions {
         viewport,
@@ -110,7 +125,7 @@ pub fn run_gui(initial_files: Vec<PathBuf>, config: EzConfig) -> eframe::Result 
         "EzThumb",
         options,
         Box::new(move |cc| {
-            let app = EzThumbApp::new(initial_files, config);
+            let app = EzThumbApp::new(initial_files, config, &cc.egui_ctx);
             apply_style(&cc.egui_ctx, app.config.theme);
             Ok(Box::new(app))
         }),
@@ -359,6 +374,7 @@ struct EzThumbApp {
     entries: Vec<QueueEntry>,
     selected_index: Option<usize>,
     system_fonts: Vec<SystemFontEntry>,
+    about_icon_texture: Option<TextureHandle>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     status_message: Option<String>,
@@ -373,10 +389,17 @@ struct EzThumbApp {
 }
 
 impl EzThumbApp {
-    fn new(initial_files: Vec<PathBuf>, config: EzConfig) -> Self {
+    fn new(initial_files: Vec<PathBuf>, config: EzConfig, ctx: &egui::Context) -> Self {
         let ffmpeg_path = find_binary("ffmpeg");
         let ffprobe_path = find_binary("ffprobe");
         let system_fonts = discover_system_fonts();
+        let about_icon_texture = load_window_icon().map(|icon| {
+            let color_img = ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            ctx.load_texture("ezthumb_about_icon", color_img, TextureOptions::LINEAR)
+        });
         let (probe_tx, probe_rx) = mpsc::channel();
         let draft = SettingsDraft::from_config(&config);
 
@@ -398,6 +421,7 @@ impl EzThumbApp {
             entries: Vec::new(),
             selected_index: None,
             system_fonts,
+            about_icon_texture,
             ffmpeg_path,
             ffprobe_path,
             status_message,
@@ -1675,6 +1699,10 @@ impl EzThumbApp {
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(10.0);
+                    if let Some(tex) = &self.about_icon_texture {
+                        ui.image((tex.id(), egui::vec2(88.0_f32, 88.0_f32)));
+                        ui.add_space(6.0);
+                    }
                     ui.label(
                         RichText::new(format!("EzThumb {}", env!("CARGO_PKG_VERSION")))
                             .strong()
@@ -2136,5 +2164,13 @@ mod tests {
 
         let applied = draft.to_config().unwrap();
         assert_eq!(applied.size, SizeSpec::ZoomPercent(50));
+    }
+
+    #[test]
+    fn decodes_embedded_application_icon() {
+        let icon = load_window_icon().expect("Embedded icon.png must decode cleanly.");
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 }
